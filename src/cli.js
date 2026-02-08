@@ -5,6 +5,7 @@ const fs = require("fs");
 const fsp = fs.promises;
 const path = require("path");
 const crypto = require("crypto");
+const readline = require("readline/promises");
 const { spawn, spawnSync } = require("child_process");
 
 const CONFLICT_MARKER_RE = /^(<<<<<<<|=======|>>>>>>>)( |$)/m;
@@ -12,6 +13,19 @@ const CONFLICT_MARKER_RE = /^(<<<<<<<|=======|>>>>>>>)( |$)/m;
 const DEFAULT_MODEL = "gpt-5.2-codex";
 const DEFAULT_REASONING_EFFORT = "xhigh";
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+const VALID_PLACEHOLDER_CHECKS = new Set(["off", "warn", "fail"]);
+const DEFAULT_PLACEHOLDER_TOKENS = [
+  "[city]",
+  "[phone]",
+  "[link]",
+  "[username]",
+  "[full name]",
+  "[studio name]",
+  "[year]",
+  "[your-city]",
+  "[your-phone]",
+  "[your-link]",
+];
 
 function die(msg, code = 1) {
   console.error(`auto-codex: ${msg}`);
@@ -136,9 +150,25 @@ async function gitBranch(repo) {
 
 async function ensureClean(repo) {
   const cp = await sh(["git", "status", "--porcelain"], { cwd: repo, capture: true });
-  if (cp.stdout.trim()) {
-    die("working tree is not clean (commit/stash first)");
+  const dirty = cp.stdout.trim();
+  if (!dirty) {
+    return;
   }
+
+  const sb = await sh(["git", "status", "-sb"], { cwd: repo, capture: true, check: false });
+  const details = [
+    "working tree is not clean (commit/stash first)",
+    "",
+    (sb.stdout || "").trim(),
+    "",
+    "Dirty paths (porcelain):",
+    dirty,
+    "",
+    "Hints:",
+    "  - commit: git add -A && git commit -m \"WIP\"",
+    "  - or stash: git stash -u",
+  ].filter(Boolean);
+  die(details.join("\n"));
 }
 
 function nowId() {
@@ -196,6 +226,540 @@ function normalizeReasoningEffort(value) {
   die(
     `invalid config.codex.reasoning_effort ${JSON.stringify(value)}; expected one of ${JSON.stringify(Array.from(VALID_REASONING_EFFORTS).sort())}`,
   );
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizePlaceholderCheckMode(value) {
+  const mode = String(value || "").trim().toLowerCase();
+  if (!mode) {
+    return "warn";
+  }
+  if (VALID_PLACEHOLDER_CHECKS.has(mode)) {
+    return mode;
+  }
+  die(
+    `invalid config.quality.placeholder_check ${JSON.stringify(value)}; expected one of ${JSON.stringify(Array.from(VALID_PLACEHOLDER_CHECKS).sort())}`,
+  );
+}
+
+function normalizePlaceholderTokens(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const seen = new Set();
+  const result = [];
+  for (const entry of value) {
+    const token = String(entry || "").trim();
+    if (!token) {
+      continue;
+    }
+    const key = token.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(token);
+  }
+  return result;
+}
+
+function isPathInside(parentDir, childPath) {
+  const rel = path.relative(parentDir, childPath);
+  if (!rel) {
+    return true;
+  }
+  return !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
+function normalizeRunId(value) {
+  const runId = String(value || "").trim();
+  if (!runId) {
+    die("run_id is required");
+  }
+  if (runId === "." || runId === "..") {
+    die(`invalid run_id: ${JSON.stringify(runId)}`);
+  }
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(runId)) {
+    die(
+      `invalid run_id: ${JSON.stringify(runId)} (expected [a-zA-Z0-9._-], no slashes)`,
+    );
+  }
+  return runId;
+}
+
+function splitCommandLine(command) {
+  const src = String(command || "").trim();
+  if (!src) {
+    return [];
+  }
+
+  const args = [];
+  let buf = "";
+  let quote = null;
+  let escaping = false;
+
+  for (const ch of src) {
+    if (escaping) {
+      buf += ch;
+      escaping = false;
+      continue;
+    }
+
+    if (ch === "\\") {
+      if (quote === "'") {
+        buf += ch;
+      } else {
+        escaping = true;
+      }
+      continue;
+    }
+
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else {
+        buf += ch;
+      }
+      continue;
+    }
+
+    if (ch === "'" || ch === "\"") {
+      quote = ch;
+      continue;
+    }
+
+    if (/\s/.test(ch)) {
+      if (buf) {
+        args.push(buf);
+        buf = "";
+      }
+      continue;
+    }
+
+    buf += ch;
+  }
+
+  if (escaping) {
+    die(`invalid command string (trailing escape): ${JSON.stringify(command)}`);
+  }
+  if (quote) {
+    die(`invalid command string (unterminated ${quote} quote): ${JSON.stringify(command)}`);
+  }
+  if (buf) {
+    args.push(buf);
+  }
+  return args;
+}
+
+function parseTaskResultPayload(payload, expectedTaskId) {
+  if (!isPlainObject(payload)) {
+    throw new Error("task result is not an object");
+  }
+
+  const taskId = String(payload.task_id || "").trim();
+  if (!taskId) {
+    throw new Error("task result missing task_id");
+  }
+  if (expectedTaskId && taskId !== expectedTaskId) {
+    throw new Error(`task_id mismatch: expected ${expectedTaskId}, got ${taskId}`);
+  }
+
+  const status = String(payload.status || "").trim();
+  if (!["done", "blocked"].includes(status)) {
+    throw new Error(`task ${taskId} has invalid status ${JSON.stringify(payload.status)}`);
+  }
+
+  const filesChangedRaw = payload.files_changed;
+  if (!Array.isArray(filesChangedRaw)) {
+    throw new Error(`task ${taskId} files_changed must be an array`);
+  }
+  const filesChanged = filesChangedRaw.map((entry) => String(entry || "").trim()).filter(Boolean);
+
+  const commandsRunRaw = payload.commands_run;
+  if (!Array.isArray(commandsRunRaw)) {
+    throw new Error(`task ${taskId} commands_run must be an array`);
+  }
+  const commandsRun = commandsRunRaw.map((entry) => String(entry || "").trim()).filter(Boolean);
+
+  return {
+    task_id: taskId,
+    status,
+    summary: String(payload.summary || ""),
+    files_changed: filesChanged,
+    commands_run: commandsRun,
+    tests: String(payload.tests || ""),
+    notes: String(payload.notes || ""),
+  };
+}
+
+async function readTaskResult(outPath, expectedTaskId) {
+  if (!(await fileExists(outPath))) {
+    throw new Error(`task output missing: ${outPath}`);
+  }
+  let payload;
+  try {
+    payload = await readJson(outPath);
+  } catch (err) {
+    throw new Error(`failed to parse ${outPath}: ${err.message}`);
+  }
+  return parseTaskResultPayload(payload, expectedTaskId);
+}
+
+function parseClarifyPayload(payload, maxQuestions) {
+  if (!isPlainObject(payload)) {
+    throw new Error("clarification output is not an object");
+  }
+
+  const needs = Boolean(payload.needs_clarification);
+  const rawQuestions = Array.isArray(payload.questions) ? payload.questions : [];
+  const seen = new Set();
+  const questions = [];
+
+  for (const [index, item] of rawQuestions.entries()) {
+    if (questions.length >= maxQuestions) {
+      break;
+    }
+    if (!isPlainObject(item)) {
+      continue;
+    }
+
+    const fallbackId = `Q${String(index + 1).padStart(2, "0")}`;
+    const id = String(item.id || fallbackId).trim().toUpperCase();
+    if (!/^Q\d{2}$/.test(id) || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+
+    const typeRaw = String(item.type || "").trim().toLowerCase();
+    const type = typeRaw === "single_choice" ? "single_choice" : typeRaw === "free_text" ? "free_text" : "";
+    if (!type) {
+      continue;
+    }
+
+    const question = String(item.question || "").trim();
+    if (!question) {
+      continue;
+    }
+
+    const required = Boolean(item.required ?? true);
+    const allowFreeText = Boolean(item.allow_free_text ?? false);
+    const options = Array.isArray(item.options)
+      ? item.options.map((entry) => String(entry || "").trim()).filter(Boolean)
+      : [];
+
+    if (type === "single_choice" && options.length === 0) {
+      continue;
+    }
+
+    questions.push({
+      id,
+      type,
+      question,
+      required,
+      allow_free_text: allowFreeText,
+      options,
+      rationale: String(item.rationale || "").trim(),
+    });
+  }
+
+  return {
+    needs_clarification: needs && questions.length > 0,
+    questions,
+  };
+}
+
+async function askSingleChoiceQuestion(rl, item, idx, total) {
+  console.log(`\n[${idx}/${total}] ${item.id}: ${item.question}`);
+  if (item.rationale) {
+    console.log(`Why: ${item.rationale}`);
+  }
+  for (let i = 0; i < item.options.length; i += 1) {
+    console.log(`  ${i + 1}. ${item.options[i]}`);
+  }
+  if (item.allow_free_text) {
+    console.log("  0. Enter custom text");
+  }
+
+  while (true) {
+    const label = item.required ? "Pick an option number" : "Pick an option number (or Enter to skip)";
+    const raw = String(await rl.question(`${label}: `)).trim();
+    if (!raw) {
+      if (!item.required) {
+        return "";
+      }
+      console.log("Answer required.");
+      continue;
+    }
+
+    if (/^\d+$/.test(raw)) {
+      const n = Number.parseInt(raw, 10);
+      if (n >= 1 && n <= item.options.length) {
+        return item.options[n - 1];
+      }
+      if (n === 0 && item.allow_free_text) {
+        const custom = String(await rl.question("Enter custom text: ")).trim();
+        if (!custom && item.required) {
+          console.log("Answer required.");
+          continue;
+        }
+        return custom;
+      }
+      console.log("Invalid option number.");
+      continue;
+    }
+
+    if (item.allow_free_text) {
+      return raw;
+    }
+
+    console.log("Please enter a numeric option.");
+  }
+}
+
+async function askFreeTextQuestion(rl, item, idx, total) {
+  console.log(`\n[${idx}/${total}] ${item.id}: ${item.question}`);
+  if (item.rationale) {
+    console.log(`Why: ${item.rationale}`);
+  }
+
+  while (true) {
+    const raw = String(await rl.question(item.required ? "Your answer: " : "Your answer (optional): ")).trim();
+    if (!raw && item.required) {
+      console.log("Answer required.");
+      continue;
+    }
+    return raw;
+  }
+}
+
+async function askClarificationQuestions(questions, { nonInteractive }) {
+  if (!questions || questions.length === 0) {
+    return [];
+  }
+
+  const interactive = !nonInteractive && Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  if (!interactive) {
+    return questions.map((item) => {
+      if (item.type === "single_choice") {
+        return {
+          id: item.id,
+          type: item.type,
+          question: item.question,
+          answer: item.options[0] || "",
+          source: "auto-default",
+        };
+      }
+      return {
+        id: item.id,
+        type: item.type,
+        question: item.question,
+        answer: "",
+        source: "auto-default",
+      };
+    });
+  }
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  try {
+    const answers = [];
+    for (let i = 0; i < questions.length; i += 1) {
+      const item = questions[i];
+      let answer = "";
+      if (item.type === "single_choice") {
+        answer = await askSingleChoiceQuestion(rl, item, i + 1, questions.length);
+      } else {
+        answer = await askFreeTextQuestion(rl, item, i + 1, questions.length);
+      }
+
+      answers.push({
+        id: item.id,
+        type: item.type,
+        question: item.question,
+        answer,
+        source: "user",
+      });
+    }
+    return answers;
+  } finally {
+    rl.close();
+  }
+}
+
+function clarificationsToPrompt(answers) {
+  if (!answers || answers.length === 0) {
+    return "";
+  }
+
+  const lines = [
+    "User clarifications:",
+  ];
+  for (const item of answers) {
+    const answer = String(item.answer || "").trim();
+    lines.push(`- ${item.id}: ${item.question}`);
+    lines.push(`  Answer: ${answer || "(empty)"}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+async function writeClarifications(runDir, questions, answers) {
+  const payload = {
+    created_at: new Date().toISOString(),
+    questions,
+    answers,
+  };
+  const jsonPath = path.join(runDir, "clarifications.json");
+  await writeText(jsonPath, `${JSON.stringify(payload, null, 2)}\n`);
+
+  const lines = [
+    "# Clarifications",
+    "",
+  ];
+  if (!answers || answers.length === 0) {
+    lines.push("No clarifications were collected.");
+  } else {
+    for (const item of answers) {
+      lines.push(`- **${item.id}** ${item.question}`);
+      lines.push(`  - answer: ${item.answer || "(empty)"}`);
+      lines.push(`  - source: ${item.source}`);
+    }
+  }
+  await writeText(path.join(runDir, "clarifications.md"), `${lines.join("\n")}\n`);
+}
+
+function collectQualityFileCandidates(repo, ordered) {
+  const files = new Set();
+  for (const result of ordered) {
+    const taskResult = result && result.task_result;
+    if (!taskResult || !Array.isArray(taskResult.files_changed)) {
+      continue;
+    }
+    for (const item of taskResult.files_changed) {
+      const relRaw = String(item || "").trim();
+      if (!relRaw) {
+        continue;
+      }
+      const abs = path.isAbsolute(relRaw) ? path.resolve(relRaw) : path.resolve(repo, relRaw);
+      if (!isPathInside(repo, abs)) {
+        continue;
+      }
+      const rel = path.relative(repo, abs).replaceAll(path.sep, "/");
+      if (!rel) {
+        continue;
+      }
+      files.add(rel);
+    }
+  }
+  return Array.from(files).sort();
+}
+
+function countOccurrences(text, token) {
+  if (!text || !token) {
+    return 0;
+  }
+  let count = 0;
+  let index = 0;
+  while (index < text.length) {
+    const found = text.indexOf(token, index);
+    if (found === -1) {
+      break;
+    }
+    count += 1;
+    index = found + token.length;
+  }
+  return count;
+}
+
+function looksBinary(buffer) {
+  const sample = buffer.subarray(0, Math.min(buffer.length, 4096));
+  for (const byte of sample) {
+    if (byte === 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function checkPlaceholderTokens(repo, files, cfg) {
+  const mode = normalizePlaceholderCheckMode(cfgGet(cfg, ["quality", "placeholder_check"], "warn"));
+  if (mode === "off") {
+    return;
+  }
+
+  const extraTokens = normalizePlaceholderTokens(cfgGet(cfg, ["quality", "placeholder_tokens"], []));
+  const mergedTokens = normalizePlaceholderTokens([...DEFAULT_PLACEHOLDER_TOKENS, ...extraTokens]);
+  if (mergedTokens.length === 0) {
+    return;
+  }
+
+  const findings = [];
+  for (const rel of files) {
+    const abs = path.resolve(repo, rel);
+    if (!isPathInside(repo, abs) || !(await fileExists(abs))) {
+      continue;
+    }
+
+    let stat;
+    try {
+      stat = await fsp.stat(abs);
+    } catch {
+      continue;
+    }
+    if (!stat.isFile() || stat.size > 1024 * 1024) {
+      continue;
+    }
+
+    let data;
+    try {
+      data = await fsp.readFile(abs);
+    } catch {
+      continue;
+    }
+    if (looksBinary(data)) {
+      continue;
+    }
+
+    const text = data.toString("utf8");
+    const lower = text.toLowerCase();
+    const matched = [];
+    for (const token of mergedTokens) {
+      const hits = countOccurrences(lower, token.toLowerCase());
+      if (hits > 0) {
+        matched.push(`${token} x${hits}`);
+      }
+    }
+    if (matched.length > 0) {
+      findings.push({
+        file: rel,
+        matched,
+      });
+    }
+  }
+
+  if (findings.length === 0) {
+    return;
+  }
+
+  const lines = [
+    "placeholder quality check found unresolved tokens:",
+  ];
+  for (const entry of findings) {
+    lines.push(`- ${entry.file}: ${entry.matched.join(", ")}`);
+  }
+  lines.push("Set config.quality.placeholder_check=\"off\" to disable this check.");
+  const msg = lines.join("\n");
+
+  if (mode === "warn") {
+    console.error(`auto-codex: warning: ${msg}`);
+    return;
+  }
+  die(msg);
 }
 
 async function ensureGitExcludes(repo, patterns) {
@@ -274,7 +838,7 @@ async function ensureScaffold(repo) {
     await copyFileEnsureDir(path.join(t, "config.default.json"), p.config);
   }
 
-  for (const name of ["plan.schema.json", "task.schema.json", "merge.schema.json"]) {
+  for (const name of ["plan.schema.json", "task.schema.json", "merge.schema.json", "clarify.schema.json"]) {
     await copyFileEnsureDir(path.join(t, "schemas", name), path.join(p.schemas, name));
   }
 
@@ -432,7 +996,7 @@ async function branchDelete(repo, branch) {
   await sh(["git", "branch", "-D", branch], { cwd: repo, check: false });
 }
 
-async function commitIfNeeded(worktreePath, message) {
+async function commitIfNeeded(worktreePath, message, { strict = false } = {}) {
   const st = await sh(["git", "status", "--porcelain"], { cwd: worktreePath, capture: true });
   if (!st.stdout.trim()) {
     return null;
@@ -444,6 +1008,11 @@ async function commitIfNeeded(worktreePath, message) {
     capture: true,
   });
   if (cp.code !== 0) {
+    if (strict) {
+      const output = `${cp.stdout || ""}${cp.stderr || ""}`.trim();
+      const details = output ? `\n${output}` : "";
+      throw new Error(`git commit failed in ${worktreePath}: ${message}${details}`);
+    }
     return null;
   }
   const sha = await sh(["git", "rev-parse", "HEAD"], { cwd: worktreePath, capture: true });
@@ -588,7 +1157,6 @@ async function mergeDepsIntoWorktree(worktreePath, {
 
     await sh(["git", "commit", "--no-verify", "-m", `Merge ${depBranch} (deps for ${taskId})`], {
       cwd: worktreePath,
-      check: false,
     });
   }
 }
@@ -733,6 +1301,138 @@ async function writeTaskMd(runDir, goal, overview, tasks) {
   }
 }
 
+function clampClarificationQuestions(value, fallback = 3) {
+  const parsed = Number.parseInt(String(value ?? fallback), 10);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.max(0, Math.min(parsed, 8));
+}
+
+function buildPlanPrompt({ goal, agents, clarificationPrompt }) {
+  const chunks = [
+    "$auto-codex-plan",
+    `Max parallel agents: ${agents}`,
+    "User goal:",
+    goal,
+    "",
+  ];
+  if (clarificationPrompt) {
+    chunks.push(clarificationPrompt);
+  }
+  return chunks.join("\n");
+}
+
+async function collectClarifications({
+  repo,
+  runDir,
+  goal,
+  cfg,
+  model,
+  webSearch,
+  reasoningEffort,
+  apiKey,
+  enabled,
+  maxQuestions,
+  nonInteractive,
+}) {
+  if (!enabled || maxQuestions <= 0) {
+    await writeClarifications(runDir, [], []);
+    return {
+      questions: [],
+      answers: [],
+      prompt: "",
+    };
+  }
+
+  const schema = path.join(repo, ".auto-codex", "schemas", "clarify.schema.json");
+  if (!(await fileExists(schema))) {
+    console.error("auto-codex: warning: clarification schema missing; continuing without questions");
+    await writeClarifications(runDir, [], []);
+    return {
+      questions: [],
+      answers: [],
+      prompt: "",
+    };
+  }
+
+  const outPath = path.join(runDir, "clarify.json");
+  const logPath = path.join(runDir, "clarify.log");
+  const prompt = [
+    "Create clarifying questions for this goal before implementation planning.",
+    "Return JSON only and match the output schema.",
+    `Ask at most ${maxQuestions} high-value questions.`,
+    "Prefer single_choice questions with concrete options when possible.",
+    "Use free_text questions only when options are insufficient.",
+    "",
+    "User goal:",
+    goal,
+    "",
+  ].join("\n");
+
+  const rc = await codexExec({
+    cwd: repo,
+    prompt,
+    outPath,
+    logPath,
+    schemaPath: schema,
+    fullAuto: false,
+    sandbox: "read-only",
+    model,
+    webSearch,
+    networkAccess: false,
+    reasoningEffort,
+    apiKey,
+  });
+
+  if (rc !== 0) {
+    console.error(`auto-codex: warning: clarification step failed (rc=${rc}). See ${logPath}`);
+    await writeClarifications(runDir, [], []);
+    return {
+      questions: [],
+      answers: [],
+      prompt: "",
+    };
+  }
+
+  let parsed;
+  try {
+    const payload = await readJson(outPath);
+    parsed = parseClarifyPayload(payload, maxQuestions);
+  } catch (err) {
+    console.error(`auto-codex: warning: invalid clarification output: ${err.message}`);
+    await writeClarifications(runDir, [], []);
+    return {
+      questions: [],
+      answers: [],
+      prompt: "",
+    };
+  }
+
+  if (!parsed.needs_clarification || parsed.questions.length === 0) {
+    await writeClarifications(runDir, [], []);
+    return {
+      questions: [],
+      answers: [],
+      prompt: "",
+    };
+  }
+
+  console.log(`Clarifications required: ${parsed.questions.length}`);
+  const answers = await askClarificationQuestions(parsed.questions, { nonInteractive });
+  const autoAnswers = answers.filter((item) => item.source === "auto-default").length;
+  if (autoAnswers > 0) {
+    console.log(`Clarifications auto-filled (${autoAnswers}) due to non-interactive mode.`);
+  }
+  await writeClarifications(runDir, parsed.questions, answers);
+
+  return {
+    questions: parsed.questions,
+    answers,
+    prompt: clarificationsToPrompt(answers),
+  };
+}
+
 async function runTask({
   repo,
   baseRef,
@@ -816,14 +1516,37 @@ async function runTask({
     apiKey,
   });
 
-  const commit = await commitIfNeeded(wt, `${tid}: ${title}`);
+  let effectiveRc = rc;
+  let taskResult = null;
+  let failureReason = "";
+
+  if (effectiveRc === 0) {
+    try {
+      taskResult = await readTaskResult(out, tid);
+      if (taskResult.status !== "done") {
+        effectiveRc = 2;
+        failureReason = `task reported status=${taskResult.status}`;
+      }
+    } catch (err) {
+      effectiveRc = 2;
+      failureReason = err.message;
+    }
+  }
+
+  let commit = null;
+  if (effectiveRc === 0) {
+    commit = await commitIfNeeded(wt, `${tid}: ${title}`, { strict: true });
+  }
 
   return {
     id: tid,
     title,
     branch,
     worktree: wt,
-    returncode: rc,
+    returncode: effectiveRc,
+    task_status: taskResult ? taskResult.status : "unknown",
+    task_result: taskResult,
+    failure_reason: failureReason,
     commit,
     codex_output: out,
     codex_log: log,
@@ -847,6 +1570,7 @@ async function scheduleTasks({
 
   let workerI = 0;
   let stopLaunching = false;
+  let firstFailureTaskId = null;
 
   const depsOk = (task) => {
     const deps = Array.isArray(task.depends_on) ? task.depends_on.map((dep) => String(dep)) : [];
@@ -883,6 +1607,29 @@ async function scheduleTasks({
     }
 
     if (running.size === 0) {
+      if (stopLaunching && pending.size > 0) {
+        const reason = firstFailureTaskId
+          ? `launching stopped because ${firstFailureTaskId} failed`
+          : "launching stopped after a task failure";
+        for (const [tid, task] of pending.entries()) {
+          results[tid] = {
+            id: tid,
+            title: String(task.title || tid),
+            branch: branchName(runId, tid),
+            worktree: worktreeDir(repo, runId, tid),
+            returncode: 130,
+            task_status: "skipped",
+            task_result: null,
+            failure_reason: "",
+            skip_reason: reason,
+            commit: null,
+            codex_output: "",
+            codex_log: "",
+          };
+        }
+        pending.clear();
+        break;
+      }
       die("task dependency deadlock (nothing ready to run)");
     }
 
@@ -899,7 +1646,9 @@ async function scheduleTasks({
 
     if (result.returncode !== 0) {
       stopLaunching = true;
-      pending.clear();
+      if (!firstFailureTaskId) {
+        firstFailureTaskId = finished.tid;
+      }
     }
   }
 
@@ -922,10 +1671,30 @@ async function writeSummary(runDir, title, overview, results) {
 
   for (const tid of Object.keys(results).sort()) {
     const result = results[tid];
-    const status = result.returncode === 0 ? "OK" : `FAIL(${result.returncode})`;
-    lines.push(`- **${tid}** ${result.title || ""} - ${status} - \`${result.branch}\` - \`${result.commit || "no commit"}\``);
-    lines.push(`  - log: \`${result.codex_log}\``);
-    lines.push(`  - result: \`${result.codex_output}\``);
+    let status = result.returncode === 0 ? "OK" : `FAIL(${result.returncode})`;
+    if (result.skip_reason) {
+      status = "SKIPPED";
+    } else if (result.task_status && result.task_status !== "unknown") {
+      status = `${status}/${String(result.task_status).toUpperCase()}`;
+    }
+
+    const branchLabel = result.branch || "n/a";
+    const commitLabel = result.commit || "no commit";
+    lines.push(`- **${tid}** ${result.title || ""} - ${status} - \`${branchLabel}\` - \`${commitLabel}\``);
+    lines.push(`  - branch: \`${branchLabel}\``);
+    lines.push(`  - commit: \`${commitLabel}\``);
+    if (result.codex_log) {
+      lines.push(`  - log: \`${result.codex_log}\``);
+    }
+    if (result.codex_output) {
+      lines.push(`  - result: \`${result.codex_output}\``);
+    }
+    if (result.skip_reason) {
+      lines.push(`  - skipped: ${result.skip_reason}`);
+    }
+    if (result.failure_reason) {
+      lines.push(`  - failure: ${result.failure_reason}`);
+    }
   }
 
   await writeText(path.join(runDir, "SUMMARY.md"), `${lines.join("\n")}\n`);
@@ -964,7 +1733,7 @@ async function mergeBranches({ repo, baseBranch, runId, ordered, cfg }) {
     });
 
     if (mergeResult.code === 0) {
-      await sh(["git", "commit", "--no-verify", "-m", `Merge ${branch}`], { cwd: repo, check: false });
+      await sh(["git", "commit", "--no-verify", "-m", `Merge ${branch}`], { cwd: repo });
       continue;
     }
 
@@ -1047,6 +1816,7 @@ async function mergeBranches({ repo, baseBranch, runId, ordered, cfg }) {
     });
 
     if (rc !== 0) {
+      await sh(["git", "merge", "--abort"], { cwd: repo, check: false });
       die(`merge agent failed (rc=${rc}). See ${logPath}`);
     }
 
@@ -1061,6 +1831,7 @@ async function mergeBranches({ repo, baseBranch, runId, ordered, cfg }) {
     }
 
     if (stillMarked.length > 0) {
+      await sh(["git", "merge", "--abort"], { cwd: repo, check: false });
       die(`merge conflict markers remain:\n${stillMarked.join("\n")}\nSee ${logPath}`);
     }
 
@@ -1074,18 +1845,39 @@ async function mergeBranches({ repo, baseBranch, runId, ordered, cfg }) {
     const remaining = cf2.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
 
     if (remaining.length > 0) {
+      await sh(["git", "merge", "--abort"], { cwd: repo, check: false });
       die(`merge conflicts remain (unmerged paths):\n${remaining.join("\n")}\nSee ${logPath}`);
     }
 
-    await sh(["git", "commit", "--no-verify", "-m", `Merge ${branch}`], { cwd: repo, check: false });
+    await sh(["git", "commit", "--no-verify", "-m", `Merge ${branch}`], { cwd: repo });
   }
+
+  let qualityFiles = collectQualityFileCandidates(repo, ordered);
+  if (qualityFiles.length === 0) {
+    const diff = await sh(["git", "diff", "--name-only", `${baseBranch}..HEAD`], {
+      cwd: repo,
+      check: false,
+      capture: true,
+    });
+    qualityFiles = diff.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+  }
+  await checkPlaceholderTokens(repo, qualityFiles, cfg);
 
   const testCmd = String(cfgGet(cfg, ["commands", "test"], "") || "").trim();
   if (testCmd) {
     console.error(`auto-codex: running tests: ${testCmd}`);
-    const result = await sh([testCmd], { cwd: repo, check: false, shell: true });
+    const useShell = Boolean(cfgGet(cfg, ["commands", "test_shell"], false));
+    const args = useShell ? [testCmd] : splitCommandLine(testCmd);
+    if (args.length === 0) {
+      die("commands.test is configured but empty after parsing");
+    }
+    const result = await sh(args, {
+      cwd: repo,
+      check: false,
+      shell: useShell,
+    });
     if (result.code !== 0) {
-      console.error("auto-codex: tests failed after merge");
+      die(`tests failed after merge (rc=${result.code})`);
     }
   }
 }
@@ -1167,10 +1959,37 @@ async function cmdPlan(args) {
   }
   const webSearch = String(codexCfg.web_search || "cached");
   const reasoningEffort = normalizeReasoningEffort(codexCfg.reasoning_effort || DEFAULT_REASONING_EFFORT);
+  const primaryApiKey = pickApiKey(cfg, 0);
+
+  const askQuestionsDefault = Boolean(cfgGet(cfg, ["planning", "ask_questions"], true));
+  const askQuestions = args.noQuestions ? false : askQuestionsDefault;
+  const nonInteractive = Boolean(args.nonInteractive || cfgGet(cfg, ["planning", "non_interactive"], false));
+  const maxQuestions = clampClarificationQuestions(
+    args.maxQuestions ?? cfgGet(cfg, ["planning", "max_questions"], 3),
+    3,
+  );
+
+  const clarification = await collectClarifications({
+    repo,
+    runDir,
+    goal: args.goal,
+    cfg,
+    model,
+    webSearch,
+    reasoningEffort,
+    apiKey: primaryApiKey,
+    enabled: askQuestions,
+    maxQuestions,
+    nonInteractive,
+  });
 
   const rc = await codexExec({
     cwd: repo,
-    prompt: `$auto-codex-plan\nMax parallel agents: ${agents}\nUser goal:\n${args.goal}\n`,
+    prompt: buildPlanPrompt({
+      goal: args.goal,
+      agents,
+      clarificationPrompt: clarification.prompt,
+    }),
     outPath: path.join(runDir, "plan.json"),
     logPath: path.join(runDir, "plan.log"),
     schemaPath: schema,
@@ -1180,7 +1999,7 @@ async function cmdPlan(args) {
     webSearch,
     networkAccess: false,
     reasoningEffort,
-    apiKey: pickApiKey(cfg, 0),
+    apiKey: primaryApiKey,
   });
 
   if (rc !== 0) {
@@ -1223,10 +2042,37 @@ async function cmdRun(args) {
   }
   const webSearch = String(codexCfg.web_search || "cached");
   const reasoningEffort = normalizeReasoningEffort(codexCfg.reasoning_effort || DEFAULT_REASONING_EFFORT);
+  const primaryApiKey = pickApiKey(cfg, 0);
+
+  const askQuestionsDefault = Boolean(cfgGet(cfg, ["planning", "ask_questions"], true));
+  const askQuestions = args.noQuestions ? false : askQuestionsDefault;
+  const nonInteractive = Boolean(args.nonInteractive || cfgGet(cfg, ["planning", "non_interactive"], false));
+  const maxQuestions = clampClarificationQuestions(
+    args.maxQuestions ?? cfgGet(cfg, ["planning", "max_questions"], 3),
+    3,
+  );
+
+  const clarification = await collectClarifications({
+    repo,
+    runDir,
+    goal: args.goal,
+    cfg,
+    model,
+    webSearch,
+    reasoningEffort,
+    apiKey: primaryApiKey,
+    enabled: askQuestions,
+    maxQuestions,
+    nonInteractive,
+  });
 
   const rc = await codexExec({
     cwd: repo,
-    prompt: `$auto-codex-plan\nMax parallel agents: ${agents}\nUser goal:\n${args.goal}\n`,
+    prompt: buildPlanPrompt({
+      goal: args.goal,
+      agents,
+      clarificationPrompt: clarification.prompt,
+    }),
     outPath: path.join(runDir, "plan.json"),
     logPath: path.join(runDir, "plan.log"),
     schemaPath: schema,
@@ -1236,7 +2082,7 @@ async function cmdRun(args) {
     webSearch,
     networkAccess: false,
     reasoningEffort,
-    apiKey: pickApiKey(cfg, 0),
+    apiKey: primaryApiKey,
   });
 
   if (rc !== 0) {
@@ -1261,8 +2107,8 @@ async function cmdRun(args) {
 
   const failed = Object.values(results).filter((result) => result.returncode !== 0);
   if (failed.length > 0) {
-    console.error(`auto-codex: some tasks failed; skipping merge. See ${path.join(runDir, "SUMMARY.md")}`);
-    return;
+    const ids = failed.map((item) => item.id).join(", ");
+    die(`some tasks failed (${ids}); skipping merge. See ${path.join(runDir, "SUMMARY.md")}`);
   }
 
   if (args.noMerge) {
@@ -1281,8 +2127,12 @@ async function cmdRun(args) {
 
 async function cmdClean(args) {
   const repo = await gitRoot(process.cwd());
-  const runId = args.run_id;
-  const root = path.join(repo, ".auto-codex", "worktrees", runId);
+  const runId = normalizeRunId(args.run_id);
+  const worktreesRoot = path.resolve(repo, ".auto-codex", "worktrees");
+  const root = path.resolve(worktreesRoot, runId);
+  if (!isPathInside(worktreesRoot, root)) {
+    die(`invalid run_id path escape attempt: ${JSON.stringify(args.run_id)}`);
+  }
   if (!(await fileExists(root))) {
     die(`no such worktree run: ${root}`);
   }
@@ -1411,11 +2261,11 @@ function printHelp(subcommand) {
   ];
 
   const planHelp = [
-    "usage: auto-codex plan <goal> [-j <agents>]",
+    "usage: auto-codex plan <goal> [-j <agents>] [--no-questions] [--non-interactive] [--max-questions <n>]",
   ];
 
   const runHelp = [
-    "usage: auto-codex run <goal> [-j <agents>] [--base <branch>] [--no-merge]",
+    "usage: auto-codex run <goal> [-j <agents>] [--base <branch>] [--no-merge] [--no-questions] [--non-interactive] [--max-questions <n>]",
   ];
 
   const cleanHelp = [
@@ -1458,6 +2308,9 @@ function parseNumericOption(flag, value) {
 function parseGoalArgs(subcommand, argv) {
   let goalTokens = [];
   let agents;
+  let noQuestions = false;
+  let nonInteractive = false;
+  let maxQuestions;
 
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
@@ -1472,6 +2325,26 @@ function parseGoalArgs(subcommand, argv) {
         die(`${subcommand}: missing value for ${token}`);
       }
       agents = parseNumericOption(token, next);
+      i += 1;
+      continue;
+    }
+
+    if (token === "--no-questions") {
+      noQuestions = true;
+      continue;
+    }
+
+    if (token === "--non-interactive") {
+      nonInteractive = true;
+      continue;
+    }
+
+    if (token === "--max-questions") {
+      const next = argv[i + 1];
+      if (next === undefined) {
+        die(`${subcommand}: missing value for --max-questions`);
+      }
+      maxQuestions = parseNumericOption("--max-questions", next);
       i += 1;
       continue;
     }
@@ -1491,6 +2364,9 @@ function parseGoalArgs(subcommand, argv) {
     cmd: subcommand,
     goal: goalTokens.join(" "),
     agents,
+    noQuestions,
+    nonInteractive,
+    maxQuestions,
   };
 }
 
@@ -1499,6 +2375,9 @@ function parseRunArgs(argv) {
   let agents;
   let base;
   let noMerge = false;
+  let noQuestions = false;
+  let nonInteractive = false;
+  let maxQuestions;
 
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
@@ -1532,6 +2411,26 @@ function parseRunArgs(argv) {
       continue;
     }
 
+    if (token === "--no-questions") {
+      noQuestions = true;
+      continue;
+    }
+
+    if (token === "--non-interactive") {
+      nonInteractive = true;
+      continue;
+    }
+
+    if (token === "--max-questions") {
+      const next = argv[i + 1];
+      if (next === undefined) {
+        die("run: missing value for --max-questions");
+      }
+      maxQuestions = parseNumericOption("--max-questions", next);
+      i += 1;
+      continue;
+    }
+
     if (token.startsWith("-")) {
       die(`run: unknown option ${token}`);
     }
@@ -1549,6 +2448,9 @@ function parseRunArgs(argv) {
     agents,
     base,
     noMerge,
+    noQuestions,
+    nonInteractive,
+    maxQuestions,
   };
 }
 

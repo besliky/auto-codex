@@ -46,7 +46,9 @@ Prefer these sources:
 {
   "version": 1,
   "agents": 4,
-  "commands": {"setup":"","test":"","lint":"","format":"","build":""},
+  "commands": {"setup":"","test":"","test_shell":false,"lint":"","format":"","build":""},
+  "planning": {"ask_questions":true,"max_questions":3,"non_interactive":false},
+  "quality": {"placeholder_check":"warn","placeholder_tokens":[]},
   "codex": {
     "model": "gpt-5.2-codex",
     "sandbox": "workspace-write",

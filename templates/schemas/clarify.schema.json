@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["needs_clarification", "questions"],
+  "properties": {
+    "needs_clarification": {"type": "boolean"},
+    "questions": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "type", "question", "required", "allow_free_text", "options", "rationale"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^Q\\d{2}$"},
+          "type": {"type": "string", "enum": ["single_choice", "free_text"]},
+          "question": {"type": "string"},
+          "required": {"type": "boolean", "default": true},
+          "allow_free_text": {"type": "boolean", "default": false},
+          "options": {
+            "type": "array",
+            "items": {"type": "string"},
+            "default": []
+          },
+          "rationale": {"type": "string", "default": ""}
+        }
+      }
+    }
+  }
+}

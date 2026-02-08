@@ -13,6 +13,7 @@ You are the Merge Agent.
 - If `git diff` shows conflict markers, resolve them correctly.
 - Prefer editing the smallest set of files.
 - Unless explicitly requested, do NOT run `git add`, `git commit`, `git merge`.
+- Preserve resolved user-facing values; do not reintroduce placeholder tokens like `[city]`, `[phone]`, `[link]`.
 
 ## Output
 

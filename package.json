@@ -37,9 +37,10 @@
   ],
   "scripts": {
     "lint": "node --check src/cli.js",
-    "test": "node ./bin/auto-codex.js --help > /dev/null",
+    "test": "npm run test:unit && node ./bin/auto-codex.js --help > /dev/null && npm run test:smoke",
+    "test:unit": "node --test --test-concurrency=1 test/*.test.js",
     "test:smoke": "node ./bin/auto-codex.js version",
-    "pack:check": "npm pack --dry-run",
+    "pack:check": "node ./scripts/pack-check.js",
     "release:patch": "npm version patch",
     "release:minor": "npm version minor",
     "release:major": "npm version major",

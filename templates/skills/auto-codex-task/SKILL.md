@@ -13,6 +13,8 @@ You are working inside a git worktree on a single task.
 - Keep changes small and focused.
 - You may run targeted checks (`test`, `lint`) if available.
 - Do NOT run `git commit`.
+- Do not leave unresolved placeholders in user-facing artifacts (for example `[city]`, `[phone]`, `[link]`).
+- If requirements are missing or conflicting, return `status: "blocked"` with clear notes instead of guessing.
 
 ## Output
 

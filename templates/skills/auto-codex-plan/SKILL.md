@@ -21,6 +21,9 @@ Include all fields required by schema:
 - Use `depends_on` only when truly required.
 - Each task prompt must be **actionable** and include quick acceptance criteria.
 - Prefer touching the smallest surface area.
+- Always include a final integration/validation task when multiple tasks produce specs/docs/assets that must be assembled into a runnable result.
+- If "User clarifications" are present in the prompt, treat them as hard constraints.
+- Avoid prompts that leave placeholders unresolved in user-facing files.
 
 ## Use repo context
 

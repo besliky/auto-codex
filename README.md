@@ -59,8 +59,17 @@ auto-codex init
 # create plan only
 auto-codex plan "Implement feature X with tests"
 
+# create plan with clarification step disabled
+auto-codex plan "Implement feature X with tests" --no-questions
+
+# limit clarification questions and force non-interactive defaults
+auto-codex plan "Implement feature X with tests" --non-interactive --max-questions 2
+
 # run full cycle (plan -> parallel tasks -> merge)
 auto-codex run "Implement feature X with tests" -j 4
+
+# run without merge
+auto-codex run "Implement feature X with tests" --no-merge
 
 # cleanup run-specific branches/worktrees
 auto-codex clean <run_id>
@@ -73,6 +82,65 @@ auto-codex version --check
 
 # update globally
 auto-codex update
+```
+
+## Orchestration Cycle
+
+`auto-codex run` executes a strict lifecycle:
+
+1. Scaffold + config loading (`.auto-codex/*`)
+2. Clarification stage (question generation + CLI answers)
+3. Plan generation (`plan.json`)
+4. Parallel task execution in isolated git worktrees
+5. Task output validation (`task.schema.json`, status must be `done`)
+6. Ordered merge back to base branch
+7. Post-merge quality checks (placeholder token scan)
+8. Optional test command (`commands.test`)
+9. Run summary and artifacts under `.auto-codex/runs/<run_id>/`
+
+Clarification artifacts are always stored as:
+
+- `.auto-codex/runs/<run_id>/clarifications.json`
+- `.auto-codex/runs/<run_id>/clarifications.md`
+
+## Planning Questions
+
+The planner can ask clarification questions before task planning:
+
+- `single_choice`: numbered options, optional custom text
+- `free_text`: open answer from CLI input
+
+Controls:
+
+- `--no-questions`
+- `--non-interactive`
+- `--max-questions <n>`
+
+In non-interactive mode, `single_choice` defaults to the first option and `free_text` defaults to empty text.
+
+## Config Highlights
+
+Generated `.auto-codex/config.json` supports:
+
+```json
+{
+  "planning": {
+    "ask_questions": true,
+    "max_questions": 3,
+    "non_interactive": false
+  },
+  "quality": {
+    "placeholder_check": "warn",
+    "placeholder_tokens": []
+  },
+  "commands": {
+    "test": "",
+    "test_shell": false
+  },
+  "codex": {
+    "reasoning_effort": "xhigh"
+  }
+}
 ```
 
 ## Versioning And Updates
@@ -89,11 +157,6 @@ npm version patch
 git push origin main --follow-tags
 ```
 
-Detailed architecture and migration rationale:
-
-- `docs/ARCHITECTURE.md`
-- `docs/MIGRATION-PLAN.md`
-
 ## Project Layout
 
 ```text
@@ -101,7 +164,6 @@ auto-codex
 bin/
 src/
 templates/
-docs/
 ```
 
 ## License
