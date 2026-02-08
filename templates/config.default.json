@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "agents": 4,
+  "commands": {
+    "setup": "",
+    "test": "",
+    "lint": "",
+    "format": "",
+    "build": ""
+  },
+  "codex": {
+    "model": "gpt-5.2-codex",
+    "sandbox": "workspace-write",
+    "web_search": "cached",
+    "network_access": false,
+    "reasoning_effort": "xhigh",
+    "full_auto": true,
+    "api_keys_env": []
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "summary", "conflicts_resolved", "commands_run", "followups"],
+  "properties": {
+    "status": {"type": "string", "enum": ["merged", "needs_attention"]},
+    "summary": {"type": "string"},
+    "conflicts_resolved": {"type": "array", "items": {"type": "string"}, "default": []},
+    "commands_run": {"type": "array", "items": {"type": "string"}, "default": []},
+    "followups": {"type": "array", "items": {"type": "string"}, "default": []}
+  }
+}

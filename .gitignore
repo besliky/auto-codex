@@ -1,0 +1,28 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tgz
+coverage/
+.nyc_output/
+dist/
+*.tsbuildinfo
+
+# Python leftovers
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+build/
+
+# Auto-Codex runtime artifacts
+.auto-codex/runs/
+.auto-codex/worktrees/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

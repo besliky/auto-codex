@@ -1,0 +1,52 @@
+{
+  "name": "auto-codex",
+  "version": "0.1.0",
+  "description": "Thin multi-agent orchestrator for Codex CLI",
+  "license": "MIT",
+  "author": "besliky",
+  "type": "commonjs",
+  "main": "src/cli.js",
+  "bin": {
+    "auto-codex": "bin/auto-codex.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "templates",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/besliky/auto-codex.git"
+  },
+  "homepage": "https://github.com/besliky/auto-codex#readme",
+  "bugs": {
+    "url": "https://github.com/besliky/auto-codex/issues"
+  },
+  "keywords": [
+    "codex",
+    "cli",
+    "automation",
+    "multi-agent",
+    "git-worktree"
+  ],
+  "scripts": {
+    "lint": "node --check src/cli.js",
+    "test": "node ./bin/auto-codex.js --help > /dev/null",
+    "test:smoke": "node ./bin/auto-codex.js version",
+    "pack:check": "npm pack --dry-run",
+    "release:patch": "npm version patch",
+    "release:minor": "npm version minor",
+    "release:major": "npm version major",
+    "prepublishOnly": "npm run lint && npm run test && npm run pack:check"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

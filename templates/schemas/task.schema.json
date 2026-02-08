@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task_id", "status", "summary", "files_changed", "commands_run", "tests", "notes"],
+  "properties": {
+    "task_id": {"type": "string"},
+    "status": {"type": "string", "enum": ["done", "blocked"]},
+    "summary": {"type": "string"},
+    "files_changed": {"type": "array", "items": {"type": "string"}},
+    "commands_run": {"type": "array", "items": {"type": "string"}, "default": []},
+    "tests": {"type": "string", "default": ""},
+    "notes": {"type": "string", "default": ""}
+  }
+}
